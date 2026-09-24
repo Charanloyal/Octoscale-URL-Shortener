@@ -9,6 +9,32 @@ OctoScale is a production-ready, ultra-high-throughput URL shortening service en
 A modern, responsive glassmorphic dashboard is built-in to allow users to shorten links, copy them, and view real-time click analytics (including referrer breakdown and browser distribution charts).
 
 ---
+## Live Demo
+
+- Application: https://octoscale-web.onrender.com
+- API documentation: https://octoscale-web.onrender.com/docs
+
+## Verified Quality
+
+- 20 automated tests passing
+- 86% total statement coverage
+- Repository pattern with isolated service and persistence layers
+- Redis-backed atomic identifier generation
+- PostgreSQL fallback to recover the Redis counter
+- Sliding-window rate limiting with Redis Sorted Sets
+- Structured JSON logging with `structlog`
+
+## Performance Benchmark
+
+The architecture is designed for high throughput, but no throughput result is
+claimed until reproduced through a committed load-test script.
+
+| Environment | Concurrent users | Throughput | p95 latency |
+|---|---:|---:|---:|
+| Pending benchmark | — | — | — |
+
+Benchmark results and raw outputs will be stored under `benchmarks/`.
+
 
 ## 🏗️ System Architecture & Data Flow
 
