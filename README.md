@@ -1,12 +1,12 @@
-# OctoScale: High-Scale Distributed URL Shortener
-
-🟢 **Live Demo**: [https://octoscale-web.onrender.com](https://octoscale-web.onrender.com)
+# OctoScale: URL Shortener with Redis Caching and Rate Limiting
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Charanloyal/octoscale-url-shortener)
 
-OctoScale is a production-ready, ultra-high-throughput URL shortening service engineered to handle **10,000+ requests per second**. It is designed with clean Object-Oriented Programming (OOP) principles, a layered clean architecture, a write-through caching strategy using Redis, database durability using PostgreSQL, and sliding window rate limiting for protection.
+OctoScale is a URL shortening service built on FastAPI, PostgreSQL and Redis. Short codes come from a Redis atomic counter (`INCR`) encoded in Base62, redirects are served from a Redis cache with a PostgreSQL fallback, click analytics are written in a FastAPI background task, and a sliding-window rate limiter on Redis sorted sets protects the API. The code uses a layered structure (routes → service → repository) with structured JSON logging.
 
-A modern, responsive glassmorphic dashboard is built-in to allow users to shorten links, copy them, and view real-time click analytics (including referrer breakdown and browser distribution charts).
+A built-in dashboard lets users shorten links, copy them, and view click analytics for a code (a referrer breakdown chart and a table of recent clicks with a browser column parsed from the user agent).
+
+**Status:** working single-instance service with a mocked-Redis/SQLite test suite. It is designed with throughput in mind (cached redirect path, deferred analytics writes), but **no load test has been run yet, so no throughput or latency figures are claimed** (see [Performance](#performance)).
 
 ---
 ## Live Demo
@@ -14,26 +14,27 @@ A modern, responsive glassmorphic dashboard is built-in to allow users to shorte
 - Application: https://octoscale-web.onrender.com
 - API documentation: https://octoscale-web.onrender.com/docs
 
-## Verified Quality
+The demo runs on Render's free tier and may take a while to wake up or be unavailable (it returned HTTP 503 when last checked).
 
-- 20 automated tests passing
-- 86% total statement coverage
-- Repository pattern with isolated service and persistence layers
-- Redis-backed atomic identifier generation
-- PostgreSQL fallback to recover the Redis counter
-- Sliding-window rate limiting with Redis Sorted Sets
+## What Is Implemented
+
+- Repository pattern with separate service and persistence layers
+- Redis-backed atomic identifier generation (`INCR` + Base62)
+- PostgreSQL fallback (`SELECT MAX(id)`) to re-seed the Redis counter if it is lost
+- Sliding-window rate limiting with Redis sorted sets (fails open if Redis is unavailable)
+- Click analytics recorded in a background task after the redirect is returned
 - Structured JSON logging with `structlog`
+- 20 automated tests (pytest, mocked Redis, in-memory SQLite); see [Testing and Coverage](#-testing-and-coverage)
 
-## Performance Benchmark
+## Performance
 
-The architecture is designed for high throughput, but no throughput result is
-claimed until reproduced through a committed load-test script.
+No benchmark has been run yet and no load-test script is committed, so this table is intentionally empty.
 
 | Environment | Concurrent users | Throughput | p95 latency |
 |---|---:|---:|---:|
-| Pending benchmark | — | — | — |
+| Not yet measured | — | — | — |
 
-Benchmark results and raw outputs will be stored under `benchmarks/`.
+To produce real numbers, add a load-test script (for example Locust or k6) under `benchmarks/`, run it against `docker-compose up` on stated hardware, and commit the raw output alongside the table. Measure the cached redirect path (`GET /{short_code}`) and the create path (`POST /api/v1/shorten`) separately, and raise `RATE_LIMIT_PER_MINUTE` for the test, because the default of 100 requests/min per IP will otherwise return HTTP 429.
 
 
 ## 🏗️ System Architecture & Data Flow
@@ -60,7 +61,7 @@ sequenceDiagram
         API-->>Client: HTTP 429 Too Many Requests
     else Allowed
         API->>Redis: GET code:{short_code}
-        alt Cache Hit (Sub-millisecond)
+        alt Cache Hit
             Redis-->>API: Returns original_url
         else Cache Miss
             API->>DB: Query original URL by short_code
@@ -69,7 +70,7 @@ sequenceDiagram
                 API-->>Client: Renders 404 Error page
             else Found
                 DB-->>API: Returns url_record
-                API->>Redis: SETEX code:{short_code} (Cache write-through)
+                API->>Redis: SETEX code:{short_code} (populate cache, 24h TTL)
             end
         end
         API->>BG: Enqueue record_click() Task
@@ -82,18 +83,19 @@ sequenceDiagram
 
 ## ⚡ Key Architecture Highlights
 
-### 1. High-Performance Distributed ID Generation
-Instead of using slow UUIDs or risk collisions with random hashes, OctoScale leverages a **Redis atomic counter** (`INCR`) to generate sequential IDs. 
-- These IDs are subsequently encoded into **Base62** strings (e.g. `10000001` becomes `P7Cv`), producing unique, short alphanumeric paths.
-- **Fail-Safe Fallback**: If the Redis cache is flushed or restarts, the system detects the missing counter, queries `SELECT MAX(id)` from PostgreSQL, seeds the Redis counter, and resumes collision-free.
+### 1. Counter-Based ID Generation
+Instead of random hashes (which need collision checks), OctoScale uses a **Redis atomic counter** (`INCR`) to generate sequential IDs.
+- These IDs are encoded into **Base62** strings (e.g. `10000001` becomes `P7Cv`), producing unique, short alphanumeric paths. The counter starts at 10,000,000, so generated codes are 4 characters until the counter passes 62⁴ (14,776,336).
+- **Fallback**: If the Redis counter key is missing (e.g. Redis was flushed or restarted without persistence), the service queries `SELECT MAX(id)` from PostgreSQL, seeds the Redis counter, and continues from there.
 
-### 2. Sub-Millisecond Redirection (Write-Through Caching)
-- When a link is resolved, it reads from Redis.
-- If it misses, it falls back to PostgreSQL, populates the Redis cache with a 24-hour Time-to-Live (TTL), and returns the redirect immediately.
-- To keep the redirect path sub-millisecond, **click tracking and analytics writes are deferred to FastAPI BackgroundTasks**. The redirect response is returned to the user immediately, and database write operations are handled asynchronously.
+### 2. Cached Redirects (Cache-Aside Reads, Cache Write on Create)
+- When a short URL is created, the mapping is written to PostgreSQL and then to Redis (24-hour TTL).
+- When a link is resolved, it reads from Redis first.
+- On a cache miss it falls back to PostgreSQL, populates the Redis cache with a 24-hour TTL, and returns the redirect.
+- To keep the redirect path short, **click tracking and analytics writes are deferred to FastAPI BackgroundTasks**: the redirect response is returned first and the database writes run afterwards in the same process.
 
 ### 3. Sliding Window Rate Limiter
-Implemented via **Redis Sorted Sets (ZSET)**. Clients are limited (default: 100 requests/min per IP) using a precise sliding window algorithm (`zremrangebyscore` and `zcard`), protecting the service from brute-force URL scraping and denial-of-service (DoS) attempts.
+Implemented via **Redis Sorted Sets (ZSET)**. Clients are limited (default: 100 requests/min per client IP, `RATE_LIMIT_PER_MINUTE`) using a sliding window (`zremrangebyscore`, `zadd`, `zcard` in one pipeline), which limits brute-force URL scraping and request floods from a single IP. If Redis is unreachable the limiter logs the error and lets the request through (fail-open).
 
 ---
 
@@ -103,8 +105,8 @@ Implemented via **Redis Sorted Sets (ZSET)**. Clients are limited (default: 100 
 - **Object Relational Mapper**: SQLAlchemy 2.0 (Asyncpg driver)
 - **Caching**: Redis (Rate limiting, ID generator, and hot-path resolution cache)
 - **Containerization**: Docker & Docker Compose (Multi-stage builds)
-- **Observability**: Structured JSON logging (`structlog`) for standard production log ingestion (Datadog, ELK, Splunk)
-- **Testing**: Pytest with `pytest-cov` and `pytest-mock` (Fully mocked, decoupled test suite running on an in-memory SQLite database)
+- **Observability**: Structured logging with `structlog` (JSON output when `APP_ENV=production`), suitable for log aggregators
+- **Testing**: Pytest with `pytest-asyncio`, `pytest-cov` and `pytest-mock` (in-process mock Redis and an in-memory SQLite database)
 
 ---
 
@@ -128,7 +130,7 @@ The FastAPI startup lifecycle automatically creates the required PostgreSQL data
 
 ## 🧪 Testing and Coverage
 
-The test suite runs using `pytest` and mocks Redis/Postgres services. It runs on an in-memory SQLite backend using the async `aiosqlite` dialect to ensure fast execution and database schema validation.
+The test suite uses `pytest` with an in-process mock of Redis (`tests/conftest.py`) and an in-memory SQLite database via the async `aiosqlite` dialect, so it needs neither Redis nor PostgreSQL. Because of this, it does not exercise real Redis semantics (TTL expiry, pipelines/transactions) or PostgreSQL-specific behaviour.
 
 ### Run Tests locally
 ```bash
@@ -144,6 +146,7 @@ pytest --cov=app --cov-report=term-missing tests/
 ```
 
 ### Coverage Report
+Output below was recorded by the author (20 test functions exist in `tests/`); it is not generated in CI, so re-run the command above to reproduce it.
 ```
 =============================== tests coverage ================================
 Name                                 Stmts   Miss  Cover   Missing
@@ -174,53 +177,30 @@ TOTAL                                  408     56    86%
 
 ---
 
-## 🚀 Cloud Deployment Guide (Live Link Setup)
+## Deployment
 
-To show recruiters a working live demo, you can deploy OctoScale easily on **Render** or **Railway**.
+The service is a single Docker image (`Dockerfile`) that needs a PostgreSQL database and a Redis instance, configured through `DATABASE_URL`, `REDIS_URL`, `BASE_URL` and `APP_ENV` (see `.env.example`). A `postgresql://` URL is rewritten to the `postgresql+asyncpg://` driver automatically.
 
-### Option A: Deploy to Railway (Recommended)
-Railway handles Docker Compose configurations out of the box:
-1. Push this repository to your GitHub account.
-2. Sign in to [Railway.app](https://railway.app/).
-3. Click **New Project** -> **Deploy from GitHub repo** and select your repository.
-4. Railway will automatically detect the `Dockerfile` and provision PostgreSQL and Redis services if you click **Add Service** inside the dashboard.
-5. Link them by setting the Environment Variables in the web settings panel:
+### Render (Blueprint)
+The repository includes a `render.yaml` Blueprint that defines the web service (Docker), a Render Key Value (Redis-compatible) instance and a PostgreSQL database, all on the free plan. Create a new **Blueprint** on Render, point it at this repository, and update `BASE_URL` in `render.yaml` to your service URL.
+
+### Railway
+1. Create a project from this GitHub repository; Railway builds the `Dockerfile`.
+2. Add PostgreSQL and Redis services from the dashboard.
+3. Set the environment variables on the web service:
    - `DATABASE_URL` = `${{Postgres.DATABASE_URL}}`
    - `REDIS_URL` = `${{Redis.REDIS_URL}}`
    - `BASE_URL` = `https://<your-railway-app-name>.up.railway.app`
    - `APP_ENV` = `production`
 
-### Option B: Deploy to Render (Blueprint Specification)
-You can deploy using Render's infrastructure by creating a Blueprint config. Create a file called `render.yaml` in the root:
+---
 
-```yaml
-services:
-  - type: web
-    name: octoscale-web
-    env: docker
-    plan: free
-    envVars:
-      - key: APP_ENV
-        value: production
-      - key: BASE_URL
-        value: https://octoscale-web.onrender.com # Replace with your URL
-      - key: DATABASE_URL
-        fromDatabase:
-          name: octoscale-db
-          property: connectionString
-      - key: REDIS_URL
-        fromService:
-          name: octoscale-redis
-          type: redis
-          property: connectionString
+## Limitations
 
-databases:
-  - name: octoscale-db
-    plan: free
-
-interfaces:
-  - type: redis
-    name: octoscale-redis
-    plan: free
-```
-Commit this file, create a new **Blueprint** on Render, point it to your GitHub repo, and Render will deploy the web app, Redis, and Postgres instances together automatically.
+- **No load test or benchmark yet** – throughput and latency are unmeasured.
+- **Single instance** – background click recording runs in the web process (FastAPI `BackgroundTasks`), not a durable queue; clicks in flight are lost if the process stops.
+- **Schema management** – tables are created with `create_all` on startup; there are no migrations (e.g. Alembic).
+- **Analytics endpoint** loads all click rows for a URL and sorts them in memory before returning the latest 100, which will slow down for very popular links.
+- **Custom codes vs generated codes** – a custom code is not reserved against future counter values, so a custom 4-character code could later collide with a generated one (rejected by the unique constraint on `short_code`).
+- **Client IP behind a proxy** – the rate limiter keys on `request.client.host`; behind a reverse proxy (e.g. Render) uvicorn must be configured to trust forwarded headers, otherwise clients may share one limit.
+- **Tests use mocks** – Redis is mocked and SQLite replaces PostgreSQL; there is no CI workflow or integration test against real services.
